@@ -17,6 +17,9 @@ This repository now contains a Rust implementation at the project root. The orig
 - `--host`, `--port` — SSH server host and port (default port is 22)
 - `--user`, `--password` — SSH credentials
 - `--timeout` — SSH connection timeout in seconds (default 20)
+- `--retries` — max attempts to establish SSH; `0` means retry forever (default 0)
+- `--retry-interval` — seconds to wait between reconnect attempts (default 5)
+- `--keepalive` — send SSH keepalive every N seconds; `0` disables (default 30)
 - `--list` — path to a file with tunnels. Supported line formats:
   - Static local forwarding: `<local_port>;<remote_host>:<remote_port>`
   - Dynamic forwarding (SOCKS5, like PuTTY `D<port>`):

@@ -36,6 +36,18 @@ struct Args {
     #[arg(long, default_value = "20")]
     timeout: u64,
 
+    /// Max retries to establish SSH after a failure (0 = retry forever)
+    #[arg(long, default_value = "0")]
+    retries: u32,
+
+    /// Seconds to wait between SSH reconnect attempts
+    #[arg(long, default_value = "5")]
+    retry_interval: u64,
+
+    /// Enable SSH keepalive pings (seconds, 0 = disabled)
+    #[arg(long, default_value = "30")]
+    keepalive: u32,
+
     /// CSV list of tunnels. Supported formats per line:
     /// - "<local_port>;<remote_host>:<remote_port>" for static local forwarding
     /// - "D<local_port>" or "<local_port>;D" for dynamic SOCKS5 forwarding on <local_port>
@@ -229,14 +241,53 @@ fn ssh_connect(args: &Args) -> Result<Session> {
     if !session.authenticated() {
         anyhow::bail!("SSH authentication rejected");
     }
+    // Configure keepalive if requested
+    if args.keepalive == 0 {
+        // disable explicit keepalives
+        let _ = session.set_keepalive(false, 0);
+    } else {
+        let _ = session.set_keepalive(true, args.keepalive);
+    }
     Ok(session)
 }
 
-fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mut client_stream: TcpStream, _shutdown: Arc<AtomicBool>) -> Result<()> {
+fn ssh_connect_with_retry(args: &Args, shutdown: Arc<AtomicBool>) -> Result<Session> {
+    let mut attempt: u32 = 0;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            anyhow::bail!("Shutdown requested");
+        }
+        attempt = attempt.saturating_add(1);
+        match ssh_connect(args) {
+            Ok(sess) => {
+                if attempt > 1 { info!("SSH reconnected after {} attempt(s)", attempt); }
+                return Ok(sess);
+            }
+            Err(e) => {
+                let max = if args.retries == 0 { "∞".to_string() } else { args.retries.to_string() };
+                warn!("SSH connect attempt {} / {} failed: {}", attempt, max, e);
+                if args.retries != 0 && attempt >= args.retries {
+                    return Err(anyhow::anyhow!("SSH connection failed after {} attempts: {}", attempt, e));
+                }
+                // Sleep before retry, checking for shutdown periodically
+                let total_ms = args.retry_interval.saturating_mul(1000);
+                let mut waited_ms = 0u64;
+                while waited_ms < total_ms {
+                    if shutdown.load(Ordering::SeqCst) { anyhow::bail!("Shutdown requested"); }
+                    let step_ms = 250u64.min(total_ms - waited_ms);
+                    thread::sleep(Duration::from_millis(step_ms));
+                    waited_ms += step_ms;
+                }
+            }
+        }
+    }
+}
+
+fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mut client_stream: TcpStream, shutdown: Arc<AtomicBool>) -> Result<()> {
     client_stream.set_nodelay(true).ok();
 
-    // SSH connect
-    let session = ssh_connect(args)?;
+    // SSH connect with retry
+    let session = ssh_connect_with_retry(args, shutdown.clone())?;
 
     // Open direct-tcpip channel to target
     let mut channel = session
@@ -329,11 +380,25 @@ fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdow
         }
     };
 
-    // Connect over SSH to dest
-    let session = ssh_connect(args)?;
-    let mut channel = session
-        .channel_direct_tcpip(&dest_host, dest_port, None)
-        .with_context(|| format!("failed to open direct-tcpip to {}:{}", dest_host, dest_port))?;
+    // Connect over SSH to dest (with retry)
+    let session = match ssh_connect_with_retry(args, _shutdown.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            // reply: general failure
+            let reply = [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            let _ = client_stream.write_all(&reply);
+            return Err(e);
+        }
+    };
+    let mut channel = match session.channel_direct_tcpip(&dest_host, dest_port, None) {
+        Ok(c) => c,
+        Err(e) => {
+            // reply: connection refused
+            let reply = [0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            let _ = client_stream.write_all(&reply);
+            return Err(e.into());
+        }
+    };
 
     // Send success reply (bound addr/port set to 0.0.0.0:0)
     let success = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
