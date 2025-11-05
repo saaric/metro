@@ -423,3 +423,6 @@ fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdow
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
