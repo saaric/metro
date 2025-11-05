@@ -162,25 +162,25 @@ fn handle_connection(args: &Args, t: &TunnelCfg, mut client_stream: TcpStream, s
     client_stream.set_nodelay(true).ok();
 
     // Establish TCP to SSH server
-    let ssh_addr = format!("{}:{}", args.host, args.port);
-    let mut tcp = TcpStream::connect(&ssh_addr)
-        .with_context(|| format!("failed to connect to SSH server at {}", ssh_addr))?;
+    let ssh_address = format!("{}:{}", args.host, args.port);
+    let mut tcp = TcpStream::connect(&ssh_address)
+        .with_context(|| format!("failed to connect to SSH server at {}", ssh_address))?;
     tcp.set_read_timeout(Some(Duration::from_secs(args.timeout))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(args.timeout))).ok();
 
     // SSH handshake
-    let mut sess = Session::new().context("failed to create SSH session")?;
-    sess.set_tcp_stream(tcp);
-    sess.set_timeout((args.timeout * 1000) as u32);
-    sess.handshake().context("SSH handshake failed")?;
-    sess.userauth_password(&args.user, &args.password)
+    let mut session = Session::new().context("failed to create SSH session")?;
+    session.set_tcp_stream(tcp);
+    session.set_timeout((args.timeout * 1000) as u32);
+    session.handshake().context("SSH handshake failed")?;
+    session.userauth_password(&args.user, &args.password)
         .context("SSH authentication failed")?;
-    if !sess.authenticated() {
+    if !session.authenticated() {
         anyhow::bail!("SSH authentication rejected");
     }
 
     // Open direct-tcpip channel to target
-    let mut channel = sess
+    let mut channel = session
         .channel_direct_tcpip(&t.remote_host, t.remote_port, None)
         .with_context(|| format!("failed to open direct-tcpip channel to {}:{}", t.remote_host, t.remote_port))?;
 
@@ -189,17 +189,17 @@ fn handle_connection(args: &Args, t: &TunnelCfg, mut client_stream: TcpStream, s
     let mut server_write = channel.stream(0);
 
     // client -> server
-    let mut ch_clone = channel.stream(0);
-    let (mut cr, mut cw) = match client_stream.try_clone() {
+    let mut channel_clone = channel.stream(0);
+    let (mut stream_read, mut stream_write) = match client_stream.try_clone() {
         Ok(s) => (client_stream, s),
         Err(e) => return Err(e.into()),
     };
 
-    let t1 = thread::spawn(move || io::copy(&mut cr, &mut ch_clone).map(|_| ()) );
-    let t2 = thread::spawn(move || io::copy(&mut server_read, &mut cw).map(|_| ()) );
+    let thread1 = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone).map(|_| ()) );
+    let thread2 = thread::spawn(move || io::copy(&mut server_read, &mut stream_write).map(|_| ()) );
 
-    let _ = t1.join();
-    let _ = t2.join();
+    let _ = thread1.join();
+    let _ = thread2.join();
 
     // Attempt to close channel gracefully
     if let Err(e) = server_write.flush() { warn!("flush error: {}", e); }
