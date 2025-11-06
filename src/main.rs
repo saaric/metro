@@ -6,7 +6,7 @@ use log::{error, info, warn};
 use ssh2::Session;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -225,15 +225,45 @@ fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<(
 }
 
 fn ssh_connect(args: &Args) -> Result<Session> {
-    let ssh_address = format!("{}:{}", args.host, args.port);
-    let mut tcp = TcpStream::connect(&ssh_address)
-        .with_context(|| format!("failed to connect to SSH server at {}", ssh_address))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(args.timeout))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(args.timeout))).ok();
+    // Resolve and connect with a finite CONNECT timeout, but keep the established
+    // TCP stream in blocking mode without per-IO timeouts to avoid spurious
+    // disconnects during long-lived tunnels.
+    let addr_str = format!("{}:{}", args.host, args.port);
+    info!("Attempting SSH connection to {} as {} with timeout {:?}", addr_str, args.user, Duration::from_secs(args.timeout));
+    let mut last_err: Option<io::Error> = None;
+    let connect_timeout = Duration::from_secs(args.timeout);
+    let mut tcp_opt: Option<TcpStream> = None;
+
+    // Try all resolved addresses until one works within the timeout
+    for addr in addr_str
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve SSH server address {}", addr_str))?
+    {
+        match TcpStream::connect_timeout(&addr, connect_timeout) {
+            Ok(s) => { tcp_opt = Some(s); break; }
+            Err(e) => { last_err = Some(e); continue; }
+        }
+    }
+
+    let mut tcp = match tcp_opt {
+        Some(s) => s,
+        None => return Err(anyhow::anyhow!(
+            "failed to connect to SSH server at {} within {:?}: {}",
+            addr_str,
+            connect_timeout,
+            last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string())
+        )),
+    };
+
+    // Ensure blocking mode; do not set per-read/write timeouts.
+    let _ = tcp.set_nonblocking(false);
 
     let mut session = Session::new().context("failed to create SSH session")?;
     session.set_tcp_stream(tcp);
-    session.set_timeout((args.timeout * 1000) as u32);
+
+    // Disable libssh2 operation timeout (0 = infinite) to prevent idle tunnels from timing out.
+    session.set_timeout(0);
+
     session.handshake().context("SSH handshake failed")?;
     session
         .userauth_password(&args.user, &args.password)
@@ -248,6 +278,7 @@ fn ssh_connect(args: &Args) -> Result<Session> {
     } else {
         let _ = session.set_keepalive(true, args.keepalive);
     }
+    info!("SSH connection established to {}:{} as {}", args.host, args.port, args.user);
     Ok(session)
 }
 
@@ -267,6 +298,7 @@ fn ssh_connect_with_retry(args: &Args, shutdown: Arc<AtomicBool>) -> Result<Sess
                 let max = if args.retries == 0 { "∞".to_string() } else { args.retries.to_string() };
                 warn!("SSH connect attempt {} / {} failed: {}", attempt, max, e);
                 if args.retries != 0 && attempt >= args.retries {
+                    error!("SSH connection failed after {} attempts: {}", attempt, e);
                     return Err(anyhow::anyhow!("SSH connection failed after {} attempts: {}", attempt, e));
                 }
                 // Sleep before retry, checking for shutdown periodically
@@ -284,6 +316,8 @@ fn ssh_connect_with_retry(args: &Args, shutdown: Arc<AtomicBool>) -> Result<Sess
 }
 
 fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mut client_stream: TcpStream, shutdown: Arc<AtomicBool>) -> Result<()> {
+    // Accepted sockets inherit nonblocking from the listener; switch back to blocking for blocking-style I/O
+    let _ = client_stream.set_nonblocking(false);
     client_stream.set_nodelay(true).ok();
 
     // SSH connect with retry
@@ -305,11 +339,23 @@ fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mu
         Err(e) => return Err(e.into()),
     };
 
-    let thread1 = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone).map(|_| ()) );
-    let thread2 = thread::spawn(move || io::copy(&mut server_read, &mut stream_write).map(|_| ()) );
+    info!("Started static tunnel relay: client -> {}:{} and back", remote_host, remote_port);
 
-    let _ = thread1.join();
-    let _ = thread2.join();
+    let thread_c2s = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone));
+    let thread_s2c = thread::spawn(move || io::copy(&mut server_read, &mut stream_write));
+
+    let bytes_c2s = match thread_c2s.join() {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => { warn!("client->server relay error: {}", e); 0 },
+        Err(_) => { warn!("client->server relay panicked"); 0 },
+    };
+    let bytes_s2c = match thread_s2c.join() {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => { warn!("server->client relay error: {}", e); 0 },
+        Err(_) => { warn!("server->client relay panicked"); 0 },
+    };
+
+    info!("Static tunnel closed. Transferred: client->server: {} bytes, server->client: {} bytes", bytes_c2s, bytes_s2c);
 
     // Attempt to close channel gracefully
     if let Err(e) = server_write.flush() { warn!("flush error: {}", e); }
@@ -319,6 +365,8 @@ fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mu
 }
 
 fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdown: Arc<AtomicBool>) -> Result<()> {
+    // Accepted sockets inherit nonblocking from the listener; switch back to blocking for blocking-style I/O
+    let _ = client_stream.set_nonblocking(false);
     client_stream.set_nodelay(true).ok();
 
     // SOCKS5 handshake (RFC 1928)
@@ -413,10 +461,23 @@ fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdow
         Err(e) => return Err(e.into()),
     };
 
-    let thread1 = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone).map(|_| ()) );
-    let thread2 = thread::spawn(move || io::copy(&mut server_read, &mut stream_write).map(|_| ()) );
-    let _ = thread1.join();
-    let _ = thread2.join();
+    info!("Started dynamic SOCKS relay to {}:{}", dest_host, dest_port);
+
+    let thread_c2s = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone));
+    let thread_s2c = thread::spawn(move || io::copy(&mut server_read, &mut stream_write));
+
+    let bytes_c2s = match thread_c2s.join() {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => { warn!("client->server relay error: {}", e); 0 },
+        Err(_) => { warn!("client->server relay panicked"); 0 },
+    };
+    let bytes_s2c = match thread_s2c.join() {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => { warn!("server->client relay error: {}", e); 0 },
+        Err(_) => { warn!("server->client relay panicked"); 0 },
+    };
+
+    info!("Dynamic SOCKS relay closed for {}:{}. Transferred: client->server: {} bytes, server->client: {} bytes", dest_host, dest_port, bytes_c2s, bytes_s2c);
 
     if let Err(e) = server_write.flush() { warn!("flush error: {}", e); }
     if let Err(e) = channel.close() { warn!("channel close error: {}", e); }
