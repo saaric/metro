@@ -708,6 +708,7 @@ fn run_dynamic_socks5_loop(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>
     // Establish SSH session once
     let mut session = ssh_connect_with_retry(args, shutdown.clone())?;
     session.set_blocking(false);
+    let mut last_keepalive = Instant::now();
     info!("Dynamic: SSH session up; entering event loop on {}", bind_addr);
 
     let mut clients: Vec<DynClient> = Vec::new();
@@ -715,6 +716,27 @@ fn run_dynamic_socks5_loop(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>
 
     loop {
         if shutdown.load(Ordering::SeqCst) { break; }
+
+        // Periodic SSH keepalive/health check and auto-reconnect
+        if args.keepalive > 0 && last_keepalive.elapsed() >= Duration::from_secs(args.keepalive as u64) {
+            match session.keepalive_send() {
+                Ok(_) => { last_keepalive = Instant::now(); }
+                Err(e) => {
+                    warn!("Dynamic: SSH keepalive failed: {}. Reconnecting session...", e);
+                    // Mark existing channel-based clients for closing; pending OpenChannel can retry
+                    for c in clients.iter_mut() {
+                        if c.channel.is_some() {
+                            c.hs_state = HsState::Closing;
+                        }
+                    }
+                    // Reconnect session
+                    session = ssh_connect_with_retry(args, shutdown.clone())?;
+                    session.set_blocking(false);
+                    last_keepalive = Instant::now();
+                    info!("Dynamic: SSH session re-established after keepalive failure");
+                }
+            }
+        }
 
         // Accept as many new connections as available
         loop {
@@ -881,8 +903,25 @@ fn run_dynamic_socks5_loop(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>
                     let port = match c.dest_port { Some(p) => p, None => { c.hs_state = HsState::Closing; continue; } };
                     // Perform channel open in blocking mode to avoid libssh2 EAGAIN bookkeeping here
                     session.set_blocking(true);
-                    let open_res = session.channel_direct_tcpip(&host, port, None);
+                    let mut open_res = session.channel_direct_tcpip(&host, port, None);
                     session.set_blocking(false);
+                    if open_res.is_err() {
+                        warn!("Dynamic: client#{} channel open to {}:{} failed; attempting SSH session reconnect and retry...", c.id, host, port);
+                        // Reconnect SSH session and retry once
+                        match ssh_connect_with_retry(args, shutdown.clone()) {
+                            Ok(mut new_sess) => {
+                                new_sess.set_blocking(false);
+                                session = new_sess; // replace session
+                                // Retry open (in blocking mode for the call)
+                                session.set_blocking(true);
+                                open_res = session.channel_direct_tcpip(&host, port, None);
+                                session.set_blocking(false);
+                            }
+                            Err(e) => {
+                                warn!("Dynamic: SSH session reconnect failed while opening channel for client#{}: {}", c.id, e);
+                            }
+                        }
+                    }
                     match open_res {
                         Ok(ch) => {
                             c.channel = Some(ch);
@@ -893,7 +932,7 @@ fn run_dynamic_socks5_loop(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>
                             info!("Dynamic: client#{} connected to {}:{}", c.id, host, port);
                         }
                         Err(e) => {
-                            warn!("Dynamic: client#{} channel open to {}:{} failed: {}", c.id, host, port, e);
+                            warn!("Dynamic: client#{} channel open to {}:{} failed after retry: {}", c.id, host, port, e);
                             c.write_buf = Some((vec![0x05, 0x05, 0x00, 0x01, 0,0,0,0, 0,0], 0));
                             c.hs_state = HsState::Closing;
                         }
