@@ -8,10 +8,11 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "metro", about = "Simple SSH tunneling tool (Rust edition)")]
@@ -47,6 +48,10 @@ struct Args {
     /// Enable SSH keepalive pings (seconds, 0 = disabled)
     #[arg(long, default_value = "30")]
     keepalive: u32,
+
+    /// Seconds to wait for local bind if port is busy (0 = fail immediately)
+    #[arg(long, default_value = "0")]
+    bind_wait: u64,
 
     /// CSV list of tunnels. Supported formats per line:
     /// - "<local_port>;<remote_host>:<remote_port>" for static local forwarding
@@ -124,10 +129,15 @@ fn read_tunnels(path: &PathBuf) -> Result<Vec<TunnelCfg>> {
     let file = File::open(path)?;
     let reader = io::BufReader::new(file);
     let mut res = Vec::new();
+    let mut used_ports: HashSet<u16> = HashSet::new();
     for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        let line_string = line?;
+        let mut line = line_string.trim();
+        // Strip full-line or inline comments starting with '#'
+        if let Some(hash) = line.find('#') {
+            line = line[..hash].trim();
+        }
+        if line.is_empty() { continue; }
 
         // Support formats:
         // 1) "<local_port>;<remote_host>:<remote_port>" (static)
@@ -137,7 +147,11 @@ fn read_tunnels(path: &PathBuf) -> Result<Vec<TunnelCfg>> {
             let port_str = &line[1..];
             match port_str.parse::<u16>() {
                 Ok(local_port) => {
-                    res.push(TunnelCfg { local_port, kind: TunnelKind::Dynamic });
+                    if used_ports.insert(local_port) {
+                        res.push(TunnelCfg { local_port, kind: TunnelKind::Dynamic });
+                    } else {
+                        warn!("Duplicate local port {} ignored (line: {})", local_port, line);
+                    }
                 }
                 Err(_) => {
                     warn!("Skipping invalid dynamic tunnel line: {}", line);
@@ -149,7 +163,11 @@ fn read_tunnels(path: &PathBuf) -> Result<Vec<TunnelCfg>> {
         let parts: Vec<&str> = line.split(';').collect();
         if parts.len() == 2 && (parts[1].eq_ignore_ascii_case("D")) {
             let local_port: u16 = parts[0].parse().with_context(|| format!("invalid local port in line: {}", line))?;
-            res.push(TunnelCfg { local_port, kind: TunnelKind::Dynamic });
+            if used_ports.insert(local_port) {
+                res.push(TunnelCfg { local_port, kind: TunnelKind::Dynamic });
+            } else {
+                warn!("Duplicate local port {} ignored (line: {})", local_port, line);
+            }
             continue;
         }
 
@@ -157,7 +175,11 @@ fn read_tunnels(path: &PathBuf) -> Result<Vec<TunnelCfg>> {
             let local_port: u16 = parts[0].parse().with_context(|| format!("invalid local port in line: {}", line))?;
             let dst = parts[1];
             let (host, port) = parse_host_port(dst).with_context(|| format!("invalid remote host:port in line: {}", line))?;
-            res.push(TunnelCfg { local_port, kind: TunnelKind::Static { remote_host: host.to_string(), remote_port: port } });
+            if used_ports.insert(local_port) {
+                res.push(TunnelCfg { local_port, kind: TunnelKind::Static { remote_host: host.to_string(), remote_port: port } });
+            } else {
+                warn!("Duplicate local port {} ignored (line: {})", local_port, line);
+            }
         } else {
             warn!("Skipping invalid tunnel line: {}", line);
         }
@@ -176,8 +198,39 @@ fn parse_host_port(s: &str) -> Result<(&str, u16)> {
 
 fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<()> {
     let bind_addr = format!("127.0.0.1:{}", t.local_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .with_context(|| format!("failed to bind local port {}", t.local_port))?;
+
+    // Try to bind the local port, optionally waiting if it's temporarily busy.
+    let bind_deadline = if args.bind_wait == 0 { None } else { Some(Instant::now() + Duration::from_secs(args.bind_wait)) };
+    let mut warned = false;
+    let listener = loop {
+        match TcpListener::bind(&bind_addr) {
+            Ok(l) => break l,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::AddrInUse {
+                    if let Some(deadline) = bind_deadline {
+                        if Instant::now() < deadline && !shutdown.load(Ordering::SeqCst) {
+                            if !warned {
+                                warn!(
+                                    "Port {} is busy; will wait up to {}s for it to become free. You can identify the owner with: netstat -ano | findstr :{}",
+                                    t.local_port, args.bind_wait, t.local_port
+                                );
+                                warned = true;
+                            }
+                            thread::sleep(Duration::from_millis(250));
+                            continue;
+                        }
+                    }
+                    anyhow::bail!(
+                        "failed to bind local port {}: {}\nThe port is already in use. On Windows, run:\n  netstat -ano | findstr :{}\nthen:\n  Get-Process -Id <PID>\nClose the conflicting process or change the local port in tunnels.csv.",
+                        t.local_port, e, t.local_port
+                    );
+                } else {
+                    return Err(anyhow::Error::new(e)).with_context(|| format!("failed to bind local port {}", t.local_port));
+                }
+            }
+        }
+    };
+
     match &t.kind {
         TunnelKind::Static { remote_host, remote_port } => {
             info!("Listening on {} and forwarding via SSH {}:{} to {}:{}", bind_addr, args.host, args.port, remote_host, remote_port);
@@ -316,49 +369,148 @@ fn ssh_connect_with_retry(args: &Args, shutdown: Arc<AtomicBool>) -> Result<Sess
 }
 
 fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mut client_stream: TcpStream, shutdown: Arc<AtomicBool>) -> Result<()> {
-    // Accepted sockets inherit nonblocking from the listener; switch back to blocking for blocking-style I/O
-    let _ = client_stream.set_nonblocking(false);
+    // Use a single-threaded, non-blocking pump to avoid concurrent libssh2 channel access deadlocks.
+    // Make client socket non-blocking and disable Nagle for lower latency.
+    let _ = client_stream.set_nonblocking(true);
     client_stream.set_nodelay(true).ok();
 
     // SSH connect with retry
-    let session = ssh_connect_with_retry(args, shutdown.clone())?;
+    let mut session = ssh_connect_with_retry(args, shutdown.clone())?;
 
-    // Open direct-tcpip channel to target
+    // Open direct-tcpip channel to target (blocking open), then switch the session to non-blocking I/O
     let mut channel = session
         .channel_direct_tcpip(remote_host, remote_port, None)
         .with_context(|| format!("failed to open direct-tcpip channel to {}:{}", remote_host, remote_port))?;
-
-    // Bi-directional relay
-    let mut server_read = channel.stream(0);
-    let mut server_write = channel.stream(0);
-
-    // client -> server
-    let mut channel_clone = channel.stream(0);
-    let (mut stream_read, mut stream_write) = match client_stream.try_clone() {
-        Ok(s) => (client_stream, s),
-        Err(e) => return Err(e.into()),
-    };
+    session.set_blocking(false);
 
     info!("Started static tunnel relay: client -> {}:{} and back", remote_host, remote_port);
 
-    let thread_c2s = thread::spawn(move || io::copy(&mut stream_read, &mut channel_clone));
-    let thread_s2c = thread::spawn(move || io::copy(&mut server_read, &mut stream_write));
+    // Pending write buffers (when peer's write would block)
+    let mut pending_c2s: Option<(Vec<u8>, usize)> = None; // (buffer, next_index)
+    let mut pending_s2c: Option<(Vec<u8>, usize)> = None;
 
-    let bytes_c2s = match thread_c2s.join() {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => { warn!("client->server relay error: {}", e); 0 },
-        Err(_) => { warn!("client->server relay panicked"); 0 },
-    };
-    let bytes_s2c = match thread_s2c.join() {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => { warn!("server->client relay error: {}", e); 0 },
-        Err(_) => { warn!("server->client relay panicked"); 0 },
-    };
+    let mut client_closed = false; // client half-closed (read EOF)
+    let mut server_closed = false; // server/channel EOF observed
 
-    info!("Static tunnel closed. Transferred: client->server: {} bytes, server->client: {} bytes", bytes_c2s, bytes_s2c);
+    let mut bytes_c2s: u64 = 0;
+    let mut bytes_s2c: u64 = 0;
+
+    let mut buf = vec![0u8; 16 * 1024];
+
+    // Pump loop
+    loop {
+        if shutdown.load(Ordering::SeqCst) { break; }
+        let mut progressed = false;
+
+        // Flush pending client->server data first
+        if let Some((ref data, ref mut pos)) = pending_c2s {
+            if *pos < data.len() {
+                match channel.write(&data[*pos..]) {
+                    Ok(w) if w > 0 => {
+                        *pos += w;
+                        bytes_c2s = bytes_c2s.saturating_add(w as u64);
+                        progressed = true;
+                    }
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if *pos >= data.len() { pending_c2s = None; }
+        } else if !client_closed {
+            // Read from client and write to server/channel
+            match client_stream.read(&mut buf) {
+                Ok(0) => {
+                    // Client closed its write side; send EOF to remote
+                    client_closed = true;
+                    let _ = channel.send_eof();
+                    progressed = true;
+                }
+                Ok(n) => {
+                    let mut written = 0usize;
+                    while written < n {
+                        match channel.write(&buf[written..n]) {
+                            Ok(w) if w > 0 => {
+                                written += w;
+                                bytes_c2s = bytes_c2s.saturating_add(w as u64);
+                                progressed = true;
+                            }
+                            Ok(_) => {}
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // Save remainder for later attempts
+                                pending_c2s = Some((buf[..n].to_vec(), written));
+                                break;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Flush pending server->client data first
+        if let Some((ref data, ref mut pos)) = pending_s2c {
+            if *pos < data.len() {
+                match client_stream.write(&data[*pos..]) {
+                    Ok(w) if w > 0 => {
+                        *pos += w;
+                        bytes_s2c = bytes_s2c.saturating_add(w as u64);
+                        progressed = true;
+                    }
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if *pos >= data.len() { pending_s2c = None; }
+        } else if !server_closed {
+            // Read from server/channel and write to client
+            match channel.read(&mut buf) {
+                Ok(0) => {
+                    server_closed = true;
+                    progressed = true;
+                }
+                Ok(n) => {
+                    let mut written = 0usize;
+                    while written < n {
+                        match client_stream.write(&buf[written..n]) {
+                            Ok(w) if w > 0 => {
+                                written += w;
+                                bytes_s2c = bytes_s2c.saturating_add(w as u64);
+                                progressed = true;
+                            }
+                            Ok(_) => {}
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                pending_s2c = Some((buf[..n].to_vec(), written));
+                                break;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Exit once both halves are closed and nothing is pending
+        if client_closed && server_closed && pending_c2s.is_none() && pending_s2c.is_none() { break; }
+
+        if !progressed {
+            // Avoid busy spin
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    info!(
+        "Static tunnel closed. Transferred: client->server: {} bytes, server->client: {} bytes",
+        bytes_c2s, bytes_s2c
+    );
 
     // Attempt to close channel gracefully
-    if let Err(e) = server_write.flush() { warn!("flush error: {}", e); }
+    if let Err(e) = channel.flush() { warn!("flush error: {}", e); }
     if let Err(e) = channel.close() { warn!("channel close error: {}", e); }
 
     Ok(())
