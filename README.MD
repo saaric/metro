@@ -11,7 +11,7 @@ This repository now contains a Rust implementation at the project root. The orig
 - Build:
   - `cargo build --release`
 - Run (example):
-  - `cargo run -- --host 192.168.0.100 --user sshuser --password sshuser --list tunnels.csv --port 22 --timeout 20`
+  - `cargo run -- --host 192.168.0.100 --user sshuser --password sshuser --list tunnels.csv --port 22 --timeout 20 --retries 0 --retry-interval 5 --keepalive 30`
 
 ### Arguments
 - `--host`, `--port` — SSH server host and port (default port is 22)
@@ -41,6 +41,8 @@ D1080
 Notes:
 - Dynamic mode implements SOCKS5 CONNECT (no authentication). It supports IPv4, IPv6, and domain-name targets.
 - Point your applications at `127.0.0.1:<port>` as a SOCKS5 proxy.
+- Dynamic mode now uses a single SSH session per dynamic listener and opens one SSH channel per client connection (multiplexing). This means only one TCP connection to the SSH server is kept while many SOCKS connections are active.
+- Implementation detail: the dynamic path runs a single-threaded non-blocking event loop to avoid concurrent use of the libssh2 session. Throughput is generally good, but a single slow client can cause brief head-of-line delays. Static tunnels continue to use one SSH session per accepted connection.
 
 Press Ctrl+C to stop the program. Logs are printed to stdout; set `RUST_LOG=info` (or `debug`) to adjust verbosity.
 

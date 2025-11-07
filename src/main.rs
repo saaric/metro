@@ -237,6 +237,9 @@ fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<(
         }
         TunnelKind::Dynamic => {
             info!("Listening on {} for dynamic SOCKS5 forwarding via SSH {}:{}", bind_addr, args.host, args.port);
+            // Hand off to a single-threaded multiplexing event loop that keeps one SSH session
+            // and opens a new direct-tcpip channel per SOCKS connection.
+            return run_dynamic_socks5_loop(args, t, shutdown, listener);
         }
     }
     listener.set_nonblocking(true).ok();
@@ -256,6 +259,7 @@ fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<(
                             }
                         }
                         TunnelKind::Dynamic => {
+                            // Should never hit: dynamic mode handled by run_dynamic_socks5_loop
                             if let Err(e) = handle_dynamic_connection(&a, client_stream, s) {
                                 error!("Dynamic connection handling error: {:#}", e);
                             }
@@ -517,6 +521,7 @@ fn handle_static_connection(args: &Args, remote_host: &str, remote_port: u16, mu
 }
 
 fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdown: Arc<AtomicBool>) -> Result<()> {
+    // Legacy single-connection handler (blocking). Kept for reference; not used in multiplexing mode.
     // Accepted sockets inherit nonblocking from the listener; switch back to blocking for blocking-style I/O
     let _ = client_stream.set_nonblocking(false);
     client_stream.set_nodelay(true).ok();
@@ -604,7 +609,7 @@ fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdow
     let success = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
     client_stream.write_all(&success).context("failed to write SOCKS5 success reply")?;
 
-    // Relay
+    // Relay via two threads (legacy)
     let mut server_read = channel.stream(0);
     let mut server_write = channel.stream(0);
     let mut channel_clone = channel.stream(0);
@@ -634,6 +639,379 @@ fn handle_dynamic_connection(args: &Args, mut client_stream: TcpStream, _shutdow
     if let Err(e) = server_write.flush() { warn!("flush error: {}", e); }
     if let Err(e) = channel.close() { warn!("channel close error: {}", e); }
 
+    Ok(())
+}
+
+fn run_dynamic_socks5_loop(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>, listener: TcpListener) -> Result<()> {
+    // Single-threaded event loop with a single SSH session and many channels.
+    use io::ErrorKind;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HsState {
+        ReadGreeting2,
+        ReadMethods { n: usize, read: usize },
+        SendMethodSel { wrote: usize },
+        ReadReq4,
+        ReadAddr { atyp: u8, need: usize }, // for domain, need expands after first len byte
+        OpenChannel,
+        SendSuccess { wrote: usize },
+        Relay,
+        Closing,
+    }
+
+    struct DynClient {
+        id: u64,
+        stream: TcpStream,
+        addr: std::net::SocketAddr,
+        hs_state: HsState,
+        hs_buf: Vec<u8>,
+        write_buf: Option<(Vec<u8>, usize)>, // pending write to client during handshake
+        dest_host: Option<String>,
+        dest_port: Option<u16>,
+        channel: Option<ssh2::Channel>,
+        // relay state
+        pending_c2s: Option<(Vec<u8>, usize)>,
+        pending_s2c: Option<(Vec<u8>, usize)>,
+        client_closed: bool,
+        server_closed: bool,
+        bytes_c2s: u64,
+        bytes_s2c: u64,
+        buf: Vec<u8>,
+    }
+
+    impl DynClient {
+        fn new(id: u64, stream: TcpStream, addr: std::net::SocketAddr) -> Self {
+            Self {
+                id,
+                stream,
+                addr,
+                hs_state: HsState::ReadGreeting2,
+                hs_buf: Vec::with_capacity(512),
+                write_buf: None,
+                dest_host: None,
+                dest_port: None,
+                channel: None,
+                pending_c2s: None,
+                pending_s2c: None,
+                client_closed: false,
+                server_closed: false,
+                bytes_c2s: 0,
+                bytes_s2c: 0,
+                buf: vec![0u8; 16 * 1024],
+            }
+        }
+    }
+
+    let bind_addr = format!("127.0.0.1:{}", t.local_port);
+    let _ = listener.set_nonblocking(true);
+
+    // Establish SSH session once
+    let mut session = ssh_connect_with_retry(args, shutdown.clone())?;
+    session.set_blocking(false);
+    info!("Dynamic: SSH session up; entering event loop on {}", bind_addr);
+
+    let mut clients: Vec<DynClient> = Vec::new();
+    let mut next_id: u64 = 1;
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) { break; }
+
+        // Accept as many new connections as available
+        loop {
+            match listener.accept() {
+                Ok((mut s, addr)) => {
+                    let _ = s.set_nonblocking(true);
+                    s.set_nodelay(true).ok();
+                    let id = next_id; next_id += 1;
+                    info!("Dynamic: accepted {} -> {} as client#{}", addr, bind_addr, id);
+                    clients.push(DynClient::new(id, s, addr));
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!("Dynamic: accept error on {}: {}", bind_addr, e);
+                    break;
+                }
+            }
+        }
+
+        let mut progressed = false;
+        let mut to_remove: Vec<usize> = Vec::new();
+
+        for (idx, c) in clients.iter_mut().enumerate() {
+            // Handshake progression until Relay
+            match c.hs_state {
+                HsState::ReadGreeting2 => {
+                    // Need 2 bytes
+                    let mut temp = [0u8; 64];
+                    match c.stream.read(&mut temp) {
+                        Ok(0) => { c.hs_state = HsState::Closing; }
+                        Ok(n) => { c.hs_buf.extend_from_slice(&temp[..n]); progressed = true; }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => { warn!("client#{} read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                    }
+                    if c.hs_buf.len() >= 2 {
+                        if c.hs_buf[0] != 0x05 {
+                            warn!("client#{} unsupported SOCKS version {}", c.id, c.hs_buf[0]);
+                            c.hs_state = HsState::Closing;
+                        } else {
+                            let n = c.hs_buf[1] as usize;
+                            c.hs_buf.drain(0..2);
+                            c.hs_state = HsState::ReadMethods { n, read: 0 };
+                        }
+                    }
+                }
+                HsState::ReadMethods { n, read } => {
+                    if read < n {
+                        let mut temp = [0u8; 256];
+                        match c.stream.read(&mut temp) {
+                            Ok(0) => { c.hs_state = HsState::Closing; }
+                            Ok(m) => {
+                                c.hs_buf.extend_from_slice(&temp[..m]);
+                                progressed = true;
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => { warn!("client#{} read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                        }
+                    }
+                    if c.hs_buf.len() >= n - read {
+                        // consume methods
+                        let take = n - read;
+                        c.hs_buf.drain(0..take);
+                        c.hs_state = HsState::SendMethodSel { wrote: 0 };
+                        c.write_buf = Some((vec![0x05, 0x00], 0));
+                    }
+                }
+                HsState::SendMethodSel { wrote } => {
+                    if let Some((ref data, ref mut pos)) = c.write_buf {
+                        match c.stream.write(&data[*pos..]) {
+                            Ok(w) if w > 0 => { *pos += w; progressed = true; }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => { warn!("client#{} write err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                        }
+                        if *pos >= data.len() {
+                            c.write_buf = None;
+                            c.hs_state = HsState::ReadReq4;
+                        }
+                    } else {
+                        // should not happen
+                        c.hs_state = HsState::ReadReq4;
+                    }
+                }
+                HsState::ReadReq4 => {
+                    let mut temp = [0u8; 64];
+                    match c.stream.read(&mut temp) {
+                        Ok(0) => { c.hs_state = HsState::Closing; }
+                        Ok(n) => { c.hs_buf.extend_from_slice(&temp[..n]); progressed = true; }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => { warn!("client#{} read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                    }
+                    if c.hs_buf.len() >= 4 {
+                        let ver = c.hs_buf[0];
+                        let cmd = c.hs_buf[1];
+                        let _rsv = c.hs_buf[2];
+                        let atyp = c.hs_buf[3];
+                        c.hs_buf.drain(0..4);
+                        if ver != 0x05 || cmd != 0x01 {
+                            // reply general failure
+                            c.write_buf = Some((vec![0x05, 0x07, 0x00, 0x01, 0,0,0,0, 0,0], 0));
+                            c.hs_state = HsState::Closing;
+                        } else {
+                            let need = match atyp { 0x01 => 4+2, 0x03 => 1, 0x04 => 16+2, _ => 0 };
+                            if need == 0 { c.write_buf = Some((vec![0x05, 0x08, 0x00, 0x01, 0,0,0,0, 0,0], 0)); c.hs_state = HsState::Closing; }
+                            else { c.hs_state = HsState::ReadAddr { atyp, need }; }
+                        }
+                    }
+                }
+                HsState::ReadAddr { atyp, need } => {
+                    // read into hs_buf
+                    let mut temp = [0u8; 512];
+                    match c.stream.read(&mut temp) {
+                        Ok(0) => { c.hs_state = HsState::Closing; }
+                        Ok(n) => { c.hs_buf.extend_from_slice(&temp[..n]); progressed = true; }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(e) => { warn!("client#{} read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                    }
+                    if c.hs_buf.len() >= need {
+                        match atyp {
+                            0x01 => { // IPv4 + port
+                                if c.hs_buf.len() >= 6 {
+                                    let host = format!("{}.{}.{}.{}", c.hs_buf[0], c.hs_buf[1], c.hs_buf[2], c.hs_buf[3]);
+                                    let port = u16::from_be_bytes([c.hs_buf[4], c.hs_buf[5]]);
+                                    c.hs_buf.drain(0..6);
+                                    c.dest_host = Some(host);
+                                    c.dest_port = Some(port);
+                                    c.hs_state = HsState::OpenChannel;
+                                }
+                            }
+                            0x03 => { // DOMAIN
+                                // need was at least 1 initially
+                                let len = c.hs_buf[0] as usize;
+                                if need == 1 {
+                                    // expand requirement
+                                    let new_need = 1 + len + 2;
+                                    c.hs_state = HsState::ReadAddr { atyp, need: new_need };
+                                } else if c.hs_buf.len() >= 1 + len + 2 {
+                                    let host = String::from_utf8_lossy(&c.hs_buf[1..1+len]).to_string();
+                                    let port = u16::from_be_bytes([c.hs_buf[1+len], c.hs_buf[1+len+1]]);
+                                    c.hs_buf.drain(0..(1+len+2));
+                                    c.dest_host = Some(host);
+                                    c.dest_port = Some(port);
+                                    c.hs_state = HsState::OpenChannel;
+                                }
+                            }
+                            0x04 => { // IPv6 + port
+                                if c.hs_buf.len() >= 18 {
+                                    let mut v6 = [0u8; 16];
+                                    v6.copy_from_slice(&c.hs_buf[0..16]);
+                                    let host = std::net::Ipv6Addr::from(v6).to_string();
+                                    let port = u16::from_be_bytes([c.hs_buf[16], c.hs_buf[17]]);
+                                    c.hs_buf.drain(0..18);
+                                    c.dest_host = Some(host);
+                                    c.dest_port = Some(port);
+                                    c.hs_state = HsState::OpenChannel;
+                                }
+                            }
+                            _ => { c.write_buf = Some((vec![0x05, 0x08, 0x00, 0x01, 0,0,0,0, 0,0], 0)); c.hs_state = HsState::Closing; }
+                        }
+                    }
+                }
+                HsState::OpenChannel => {
+                    let host = match &c.dest_host { Some(h) => h.clone(), None => { c.hs_state = HsState::Closing; continue; } };
+                    let port = match c.dest_port { Some(p) => p, None => { c.hs_state = HsState::Closing; continue; } };
+                    // Perform channel open in blocking mode to avoid libssh2 EAGAIN bookkeeping here
+                    session.set_blocking(true);
+                    let open_res = session.channel_direct_tcpip(&host, port, None);
+                    session.set_blocking(false);
+                    match open_res {
+                        Ok(ch) => {
+                            c.channel = Some(ch);
+                            // success reply: bound addr 0.0.0.0:0
+                            c.write_buf = Some((vec![0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0], 0));
+                            c.hs_state = HsState::SendSuccess { wrote: 0 };
+                            progressed = true;
+                            info!("Dynamic: client#{} connected to {}:{}", c.id, host, port);
+                        }
+                        Err(e) => {
+                            warn!("Dynamic: client#{} channel open to {}:{} failed: {}", c.id, host, port, e);
+                            c.write_buf = Some((vec![0x05, 0x05, 0x00, 0x01, 0,0,0,0, 0,0], 0));
+                            c.hs_state = HsState::Closing;
+                        }
+                    }
+                }
+                HsState::SendSuccess { wrote: _ } => {
+                    if let Some((ref data, ref mut pos)) = c.write_buf {
+                        match c.stream.write(&data[*pos..]) {
+                            Ok(w) if w > 0 => { *pos += w; progressed = true; }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => { warn!("client#{} write err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                        }
+                        if *pos >= data.len() {
+                            c.write_buf = None;
+                            c.hs_state = HsState::Relay;
+                        }
+                    } else {
+                        c.hs_state = HsState::Relay;
+                    }
+                }
+                HsState::Relay => {
+                    let ch = match c.channel.as_mut() { Some(ch) => ch, None => { c.hs_state = HsState::Closing; continue; } };
+
+                    // First, flush any pending client->server
+                    if let Some((ref data, ref mut pos)) = c.pending_c2s {
+                        if *pos < data.len() {
+                            match ch.write(&data[*pos..]) {
+                                Ok(w) if w > 0 => { *pos += w; c.bytes_c2s = c.bytes_c2s.saturating_add(w as u64); progressed = true; }
+                                Ok(_) => {}
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                                Err(e) => { warn!("client#{} ch.write err: {}", c.id, e); c.hs_state = HsState::Closing; continue; }
+                            }
+                        }
+                        if *pos >= data.len() { c.pending_c2s = None; }
+                    } else if !c.client_closed {
+                        match c.stream.read(&mut c.buf) {
+                            Ok(0) => { c.client_closed = true; let _ = ch.send_eof(); progressed = true; }
+                            Ok(n) => {
+                                let mut written = 0usize;
+                                while written < n {
+                                    match ch.write(&c.buf[written..n]) {
+                                        Ok(w) if w > 0 => { written += w; c.bytes_c2s = c.bytes_c2s.saturating_add(w as u64); progressed = true; }
+                                        Ok(_) => {}
+                                        Err(e) if e.kind() == ErrorKind::WouldBlock => { c.pending_c2s = Some((c.buf[..n].to_vec(), written)); break; }
+                                        Err(e) => { warn!("client#{} ch.write err: {}", c.id, e); c.hs_state = HsState::Closing; break; }
+                                    }
+                                }
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => { warn!("client#{} read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                        }
+                    }
+
+                    // Then, flush any pending server->client
+                    if let Some((ref data, ref mut pos)) = c.pending_s2c {
+                        if *pos < data.len() {
+                            match c.stream.write(&data[*pos..]) {
+                                Ok(w) if w > 0 => { *pos += w; c.bytes_s2c = c.bytes_s2c.saturating_add(w as u64); progressed = true; }
+                                Ok(_) => {}
+                                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                                Err(e) => { warn!("client#{} write err: {}", c.id, e); c.hs_state = HsState::Closing; continue; }
+                            }
+                        }
+                        if *pos >= data.len() { c.pending_s2c = None; }
+                    } else if !c.server_closed {
+                        match ch.read(&mut c.buf) {
+                            Ok(0) => { c.server_closed = true; progressed = true; }
+                            Ok(n) => {
+                                let mut written = 0usize;
+                                while written < n {
+                                    match c.stream.write(&c.buf[written..n]) {
+                                        Ok(w) if w > 0 => { written += w; c.bytes_s2c = c.bytes_s2c.saturating_add(w as u64); progressed = true; }
+                                        Ok(_) => {}
+                                        Err(e) if e.kind() == ErrorKind::WouldBlock => { c.pending_s2c = Some((c.buf[..n].to_vec(), written)); break; }
+                                        Err(e) => { warn!("client#{} write err: {}", c.id, e); c.hs_state = HsState::Closing; break; }
+                                    }
+                                }
+                            }
+                            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                            Err(e) => { warn!("client#{} ch.read err: {}", c.id, e); c.hs_state = HsState::Closing; }
+                        }
+                    }
+
+                    if c.client_closed && c.server_closed && c.pending_c2s.is_none() && c.pending_s2c.is_none() {
+                        c.hs_state = HsState::Closing;
+                    }
+                }
+                HsState::Closing => {
+                    // Attempt to close
+                    if let Some(mut ch) = c.channel.take() {
+                        if let Err(e) = ch.flush() { let _ = e; }
+                        if let Err(e) = ch.close() { let _ = e; }
+                    }
+                    info!("Dynamic: client#{} closed. Bytes c2s={} s2c={}", c.id, c.bytes_c2s, c.bytes_s2c);
+                    to_remove.push(idx);
+                }
+            }
+        }
+
+        // Remove closed clients from the vector (from back to front)
+        if !to_remove.is_empty() {
+            to_remove.sort_unstable();
+            to_remove.drain(..).rev().for_each(|i| { clients.remove(i); });
+            progressed = true;
+        }
+
+        if !progressed {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Shutdown: close all clients and session
+    for mut c in clients.into_iter() {
+        if let Some(mut ch) = c.channel.take() { let _ = ch.flush(); let _ = ch.close(); }
+        let _ = c.stream.shutdown(std::net::Shutdown::Both);
+    }
+    info!("Dynamic: listener {} shut down", bind_addr);
     Ok(())
 }
 
