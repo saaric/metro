@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "metro", about = "Simple SSH tunneling tool (Rust edition)")]
-struct Args {
+pub(crate) struct Args {
     /// Host for SSH
     #[arg(long)]
     host: String,
@@ -58,6 +58,10 @@ struct Args {
     /// - "D<local_port>" or "<local_port>;D" for dynamic SOCKS5 forwarding on <local_port>
     #[arg(long, value_name = "FILE")]
     list: PathBuf,
+
+    /// Launch a simple GUI editor for the tunnels list and exit
+    #[arg(long, default_value_t = false)]
+    gui: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,9 +76,16 @@ struct TunnelCfg {
     kind: TunnelKind,
 }
 
+mod gui;
+
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+
+    // If GUI is requested, open the editor for the tunnels file and exit.
+    if args.gui {
+        return gui::run_gui(&args);
+    }
 
     let tunnels = read_tunnels(&args.list)
         .with_context(|| format!("Failed to read tunnels file: {:?}", args.list))?;
