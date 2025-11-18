@@ -295,10 +295,20 @@ fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<(
                 "Listening on {} and forwarding via SSH {}:{} to {}:{}",
                 bind_addr, args.host, args.port, remote_host, remote_port
             );
+            // Explicit startup log (helps grepping for lifecycle events)
+            info!(
+                "Tunnel started: local {} -> {}:{} (via {}:{})",
+                bind_addr, remote_host, remote_port, args.host, args.port
+            );
         }
         TunnelKind::Dynamic => {
             info!(
                 "Listening on {} for dynamic SOCKS5 forwarding via SSH {}:{}",
+                bind_addr, args.host, args.port
+            );
+            // Explicit startup log for dynamic SOCKS
+            info!(
+                "Tunnel started: dynamic SOCKS5 on {} (via {}:{})",
                 bind_addr, args.host, args.port
             );
             // Hand off to a single-threaded multiplexing event loop that keeps one SSH session
@@ -351,6 +361,8 @@ fn run_tunnel(args: &Args, t: &TunnelCfg, shutdown: Arc<AtomicBool>) -> Result<(
     }
 
     info!("Shutting down listener on {}", bind_addr);
+    // Explicit shutdown log
+    info!("Tunnel stopped: local {}", bind_addr);
     Ok(())
 }
 
@@ -1413,6 +1425,11 @@ fn run_dynamic_socks5_loop(
         let _ = c.stream.shutdown(std::net::Shutdown::Both);
     }
     info!("Dynamic: listener {} shut down", bind_addr);
+    // Explicit shutdown log for lifecycle clarity
+    info!(
+        "Tunnel stopped: dynamic SOCKS5 on {} (via {}:{})",
+        bind_addr, args.host, args.port
+    );
     Ok(())
 }
 
