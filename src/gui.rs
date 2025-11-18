@@ -302,6 +302,24 @@ impl EditorApp {
             match child.kill() {
                 Ok(()) => {
                     self.status = "Tunnels stopping (terminate sent)".into();
+                    // Wait for the process to actually exit so the executable
+                    // file is no longer locked on Windows.
+                    // Use a short timeout loop with try_wait to avoid blocking UI too long.
+                    let start = std::time::Instant::now();
+                    let timeout = std::time::Duration::from_secs(3);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_status)) => break, // exited
+                            Ok(None) => {
+                                if start.elapsed() > timeout {
+                                    // Give up waiting; it will be reaped on drop when GUI exits.
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Err(_e) => break,
+                        }
+                    }
                 }
                 Err(e) => {
                     self.status = format!("Failed to stop tunnels: {e:#}");
@@ -310,9 +328,20 @@ impl EditorApp {
         } else {
             self.status = "No running tunnels to stop".into();
         }
+        // Close log channel receiver so background reader threads can finish.
+        self.log_rx = None;
         // Reflect state in UI; logs remain visible
         self.running = false;
         self.show_logs = true;
+    }
+}
+
+impl Drop for EditorApp {
+    fn drop(&mut self) {
+        // Ensure the child process is terminated when the GUI window is closed
+        // via the OS close button (X). This prevents leaving the spawned
+        // metro CLI process running, which would keep the .exe locked on Windows.
+        self.stop_tunneling();
     }
 }
 
@@ -513,40 +542,64 @@ impl eframe::App for EditorApp {
 
                     let mut clicked_index: Option<usize> = None;
                     for (i, r) in self.rows.iter().enumerate() {
-                        // Capture the start of the row to compute a full-row clickable rect later
-                        let row_start = ui.cursor().min;
-                        // In CentralPanel, use the full available right edge
-                        let row_right = ui.max_rect().right();
+                        // Track the row bounds based on actual cell widgets
+                        let row_top = ui.cursor().min.y;
+                        let mut row_left: Option<f32> = None;
+                        let mut row_right: f32 = f32::NEG_INFINITY;
 
                         let sel = self.selected == Some(i);
-                        if ui.selectable_label(sel, "").clicked() { clicked_index = Some(i); }
+                        let sel_resp = ui.selectable_label(sel, "");
+                        if sel_resp.clicked() { clicked_index = Some(i); }
+                        row_left.get_or_insert(sel_resp.rect.min.x);
+                        row_right = row_right.max(sel_resp.rect.right());
 
                         let lp = ui.add(egui::Label::new(r.local_port.to_string()).sense(egui::Sense::click()));
                         if lp.clicked() { clicked_index = Some(i); }
+                        row_left.get_or_insert(lp.rect.min.x);
+                        row_right = row_right.max(lp.rect.right());
 
                         let kind_str = match r.kind { RowKind::Static => "Static", RowKind::Dynamic => "Dynamic" };
                         let kd = ui.add(egui::Label::new(kind_str).sense(egui::Sense::click()));
                         if kd.clicked() { clicked_index = Some(i); }
+                        row_left.get_or_insert(kd.rect.min.x);
+                        row_right = row_right.max(kd.rect.right());
 
                         let host_text = if r.remote_host.is_empty() { "-" } else { &r.remote_host };
                         let rh = ui.add(egui::Label::new(host_text).sense(egui::Sense::click()));
                         if rh.clicked() { clicked_index = Some(i); }
+                        row_left.get_or_insert(rh.rect.min.x);
+                        row_right = row_right.max(rh.rect.right());
 
                         let rp_text: String = match r.remote_port { Some(p) => p.to_string(), None => "-".into() };
                         let rp = ui.add(egui::Label::new(rp_text).sense(egui::Sense::click()));
                         if rp.clicked() { clicked_index = Some(i); }
+                        row_left.get_or_insert(rp.rect.min.x);
+                        row_right = row_right.max(rp.rect.right());
 
-                        // End the row to advance the cursor to the next row start; this gives us row height
+                        // Finish this grid row and compute bottom
                         ui.end_row();
+                        let row_bottom = ui.cursor().min.y;
 
-                        // Build a full-width rectangle for the row and make it clickable
-                        let next_row_start = ui.cursor().min; // y of the next row start = bottom of this row
-                        let row_rect = egui::Rect::from_min_max(
-                            egui::Pos2::new(row_start.x, row_start.y),
-                            egui::Pos2::new(row_right, next_row_start.y),
-                        );
-                        let resp = ui.interact(row_rect, ui.id().with(("row", i)), egui::Sense::click());
-                        if resp.clicked() { clicked_index = Some(i); }
+                        // Create a per-row clickable band limited to the actual columns width
+                        if let Some(left) = row_left {
+                            let row_rect = egui::Rect::from_min_max(
+                                egui::Pos2::new(left, row_top),
+                                egui::Pos2::new(row_right, row_bottom),
+                            );
+                            let resp = ui.interact(row_rect, ui.id().with(("row_band", i)), egui::Sense::click());
+
+                            // Hover highlight: use a lighter version of the selection color (light blue-ish),
+                            // but only when the row is not currently selected.
+                            if resp.hovered() && self.selected != Some(i) {
+                                let sel_col = ui.visuals().selection.bg_fill;
+                                let [r, g, b, _a] = sel_col.to_array();
+                                // Much lighter than the actual selection fill
+                                let hover_col = egui::Color32::from_rgba_unmultiplied(r, g, b, 40);
+                                ui.painter().rect_filled(row_rect, egui::Rounding::same(0.0), hover_col);
+                            }
+
+                            if resp.clicked() { clicked_index = Some(i); }
+                        }
                     }
                     if let Some(i) = clicked_index { self.open_edit_dialog(i); }
                 });
