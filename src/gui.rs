@@ -96,6 +96,11 @@ impl EditorApp {
         if let Err(e) = app.reload() {
             app.status = format!("Failed to load: {e:#}");
         }
+        // Auto-start tunnels when the GUI launches, if there are entries.
+        // This matches the CLI behavior where tunnels start immediately.
+        if !app.rows.is_empty() {
+            app.start_tunneling();
+        }
         app
     }
 
