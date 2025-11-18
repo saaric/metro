@@ -1,6 +1,6 @@
 use super::*;
-use tempfile::NamedTempFile;
 use std::io::Write as IoWrite;
+use tempfile::NamedTempFile;
 
 #[test]
 fn test_parse_host_port_basic() {
@@ -68,7 +68,10 @@ D1080
     let mut have_dyn2 = false;
     for t in tunnels {
         match t.kind {
-            TunnelKind::Static { ref remote_host, remote_port } => {
+            TunnelKind::Static {
+                ref remote_host,
+                remote_port,
+            } => {
                 if t.local_port == 8080 && remote_host == "127.0.0.1" && remote_port == 80 {
                     have_static1 = true;
                 }
@@ -77,8 +80,12 @@ D1080
                 }
             }
             TunnelKind::Dynamic => {
-                if t.local_port == 1080 { have_dyn1 = true; }
-                if t.local_port == 1081 { have_dyn2 = true; }
+                if t.local_port == 1080 {
+                    have_dyn1 = true;
+                }
+                if t.local_port == 1081 {
+                    have_dyn2 = true;
+                }
             }
         }
     }
@@ -92,5 +99,9 @@ fn test_read_tunnels_invalid_line_errors() {
     let f = write_temp_tunnels(content);
     let list_path = f.path().to_path_buf();
     let res = read_tunnels(&list_path);
-    assert!(res.is_err(), "expected error on invalid line, got: {:?}", res);
+    assert!(
+        res.is_err(),
+        "expected error on invalid line, got: {:?}",
+        res
+    );
 }

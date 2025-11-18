@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
@@ -695,11 +694,10 @@ fn buffers_to_row(
 }
 
 pub fn run_gui(args: &crate::Args) -> Result<()> {
-    // Configure a deterministic initial window: reasonable size and maximized for consistent placement
+    // Configure a deterministic initial window: reasonable default size (not maximized)
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
-            .with_maximized(true)
             .into(),
         ..Default::default()
     };
