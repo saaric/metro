@@ -421,6 +421,10 @@ impl eframe::App for EditorApp {
             let mut style = (*ctx.style()).clone();
             // Horizontal, Vertical padding in points (logical pixels)
             style.spacing.button_padding = egui::Vec2::new(14.0, 10.0);
+            // Explicitly set scrollbar width so it's “normal” from the very start
+            // (egui 0.33: spacing.scroll controls scrollbar appearance)
+            style.spacing.scroll.bar_width = 14.0; // pick a comfortable fixed width
+            style.spacing.scroll.floating_width = 14.0; // pick a comfortable fixed width
             ctx.set_style(style);
         }
 
@@ -448,7 +452,7 @@ impl eframe::App for EditorApp {
                 )
                 // Lighter green for better readability with black label
                 .fill(egui::Color32::from_rgb(163, 245, 208)) // light mint green
-                .rounding(egui::Rounding::same(6.0))
+                .rounding(egui::Rounding::same(6))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)));
                 if ui.add(new_btn).clicked() {
                     self.open_new_dialog();
@@ -462,7 +466,7 @@ impl eframe::App for EditorApp {
                 )
                 // Lighter red for better readability with black label
                 .fill(egui::Color32::from_rgb(255, 179, 169)) // light coral
-                .rounding(egui::Rounding::same(6.0))
+                .rounding(egui::Rounding::same(6))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)));
                 let del_resp = ui.add_enabled(self.selected.is_some(), del_btn);
                 if del_resp.clicked() {
@@ -490,7 +494,7 @@ impl eframe::App for EditorApp {
                     egui::RichText::new("Run").strong().color(egui::Color32::WHITE),
                 )
                 .fill(egui::Color32::from_rgb(66, 133, 244)) // blue
-                .rounding(egui::Rounding::same(6.0))
+                .rounding(egui::Rounding::same(6))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)));
                 let run_resp = ui.add_enabled(!self.running, run_btn);
                 if run_resp.clicked() {
@@ -503,7 +507,7 @@ impl eframe::App for EditorApp {
                     egui::RichText::new("Stop").strong().color(egui::Color32::WHITE),
                 )
                 .fill(egui::Color32::from_rgb(140, 82, 255)) // purple
-                .rounding(egui::Rounding::same(6.0))
+                .rounding(egui::Rounding::same(6))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)));
                 let stop_resp = ui.add_enabled(self.running, stop_btn);
                 if stop_resp.clicked() {
@@ -595,7 +599,7 @@ impl eframe::App for EditorApp {
                                 let [r, g, b, _a] = sel_col.to_array();
                                 // Much lighter than the actual selection fill
                                 let hover_col = egui::Color32::from_rgba_unmultiplied(r, g, b, 40);
-                                ui.painter().rect_filled(row_rect, egui::Rounding::same(0.0), hover_col);
+                                ui.painter().rect_filled(row_rect, egui::Rounding::same(0), hover_col);
                             }
 
                             if resp.clicked() { clicked_index = Some(i); }
@@ -764,7 +768,7 @@ pub fn run_gui(args: &crate::Args) -> Result<()> {
     eframe::run_native(
         app_title,
         options,
-        Box::new(move |_cc| Box::new(EditorApp::new(args.clone()))),
+        Box::new(move |_cc| Ok(Box::new(EditorApp::new(args.clone())))),
     )
     .map_err(|e| anyhow!("eframe error: {e}"))
 }
